@@ -1,5 +1,5 @@
 const puppeteer = require('puppeteer');
-const { decode } = require('./utils');
+const { decode, logStreamData, verbose } = require('./utils');
 
 /**
  * Captures lightning strike data from Blitzortung.org using Puppeteer
@@ -10,49 +10,55 @@ const { decode } = require('./utils');
  */
 async function captureBlitzortungData({ onStrikeDetected, isShuttingDown }) {
   console.log('Launching browser...');
-  
+
   // Launch a headless browser
   const browser = await puppeteer.launch({
     headless: 'new',
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
-  
+
   try {
     const page = await browser.newPage();
 
     // Setup CDP session to capture WebSocket traffic
     const client = await page.target().createCDPSession();
     await client.send('Network.enable');
-    
+
     // Setup listeners for WebSocket events
     client.on('Network.webSocketCreated', ({requestId, url}) => {
       console.log('WebSocket Created:', requestId, url);
     });
-    
+
     client.on('Network.webSocketClosed', ({requestId, timestamp}) => {
       console.log('WebSocket Closed:', requestId, timestamp);
     });
-    
+
     // Listen for WebSocket messages sent from browser to server
     client.on('Network.webSocketFrameSent', ({requestId, timestamp, response}) => {
       console.log('WebSocket Frame Sent:', requestId, timestamp);
       console.log('Payload:', response.payloadData);
     });
-    
+
     // Listen for WebSocket messages received from server
     client.on('Network.webSocketFrameReceived', ({requestId, timestamp, response}) => {
-      console.log('WebSocket Frame Received:', requestId, timestamp);
-      console.log('Payload (First 100 chars):', response.payloadData.substring(0, 100));
-      
+      if (logStreamData && verbose) {
+        console.log('WebSocket Frame Received:', requestId, timestamp);
+        console.log('Payload (First 100 chars):', response.payloadData.substring(0, 100));
+      }
+
       try {
         // Decode the data using the LZW decode function from Blitzortung
         const decodedData = decode(response.payloadData);
-        console.log('Decoded data (First 150 chars):', decodedData.substring(0, 150));
-        
+        if (logStreamData && verbose) {
+          console.log('Decoded data (First 150 chars):', decodedData.substring(0, 150));
+        }
+
         try {
           const jsonData = JSON.parse(decodedData);
-          console.log('Parsed JSON data:', JSON.stringify(jsonData).substring(0, 150));
-          
+          if (logStreamData && verbose) {
+            console.log('Parsed JSON data:', JSON.stringify(jsonData).substring(0, 150));
+          }
+
           // Extract coordinates and other useful data
           if (jsonData.lat !== undefined && jsonData.lon !== undefined) {
             const strike = {
@@ -62,7 +68,11 @@ async function captureBlitzortungData({ onStrikeDetected, isShuttingDown }) {
               lng: +jsonData['lon'],
             };
 
-            console.log('Extracted strike data:', strike);
+            if (logStreamData && verbose) {
+              console.log('Extracted strike data:', strike);  
+            } else if (logStreamData) {
+              console.log('Extracted strike data:', JSON.stringify(strike));
+            }
 
             // Notify the caller about the new strike
             if (typeof onStrikeDetected === 'function') {

@@ -4,9 +4,11 @@
     "description": "WebSocket relay server for lightning data",
     "main": "server.js",
     "scripts": {
-        "start": "node server.js"
+        "start": "node server.js",
+        "start:verbose": "VERBOSE=true node server.js"
     },
     "dependencies": {
+        "dotenv": "^16.5.0",
         "puppeteer": "^22.1.0",
         "ws": "^8.13.0"
     }

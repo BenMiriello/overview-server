@@ -1,6 +1,15 @@
+require('dotenv').config();
+
+// Parse command line arguments
+const args = process.argv.slice(2);
+if (args.includes('--verbose')) {
+  process.env.VERBOSE = 'true';
+}
+
 const http = require('http');
 const WebSocket = require('ws');
 const { captureBlitzortungData } = require('./lightning_data');
+const { verbose } = require('./utils');
 
 // Create a simple HTTP server
 const server = http.createServer((req, res) => {
@@ -53,6 +62,7 @@ function handleNewStrike(strike) {
 const PORT = process.env.PORT || 3001;
 const httpServer = server.listen(PORT, () => {
   console.log(`Lightning relay server running on port ${PORT}`);
+  console.log(`Verbose mode: ${verbose ? 'ENABLED' : 'DISABLED'}`);
 
   // Start capturing WebSocket data
   captureBlitzortungData({ 

@@ -31,6 +31,11 @@ function decode(message) {
   }
 }
 
+const logStreamData = process.env.LOG_STREAM_DATA === 'true';
+const verbose       = process.env.VERBOSE         === 'true';
+
 module.exports = {
-  decode
+  decode,
+  logStreamData,
+  verbose,
 };
