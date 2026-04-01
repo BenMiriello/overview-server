@@ -11,8 +11,43 @@ const WebSocket = require('ws');
 const { captureBlitzortungData } = require('./lightning_data');
 const { verbose } = require('./utils');
 
-// Create a simple HTTP server
+// Compute weighted centroid of recent strikes
+function getHotspot(windowMs = 5 * 60 * 1000) {
+  const cutoff = Date.now() - windowMs;
+  const recent = strikes.filter(s => s.timestamp >= cutoff);
+  if (recent.length === 0) return null;
+
+  let totalWeight = 0;
+  let weightedLat = 0;
+  let weightedLng = 0;
+
+  for (const s of recent) {
+    const age = Date.now() - s.timestamp;
+    const weight = 1 - (age / windowMs);
+    weightedLat += s.lat * weight;
+    weightedLng += s.lng * weight;
+    totalWeight += weight;
+  }
+
+  return {
+    lat: weightedLat / totalWeight,
+    lng: weightedLng / totalWeight,
+    count: recent.length,
+  };
+}
+
+// Create HTTP server with API routes
 const server = http.createServer((req, res) => {
+  if (req.url === '/api/hotspot' && req.method === 'GET') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    });
+    const hotspot = getHotspot();
+    res.end(JSON.stringify(hotspot));
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Lightning relay server is running\n');
 });
