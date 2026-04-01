@@ -37,14 +37,40 @@ function broadcastToClients(data) {
 // Handle client connections
 wss.on('connection', (ws) => {
   console.log('Client connected');
+  ws.isAlive = true;
 
-  // Note: We no longer send initial strikes to the client
-  // Starting with 0 strikes and only showing live ones as they come in
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      if (data.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }));
+      }
+    } catch (e) {
+      // Ignore non-JSON messages
+    }
+  });
 
   ws.on('close', () => {
     console.log('Client disconnected');
   });
 });
+
+// Ping all clients every 20s; terminate unresponsive ones
+const PING_INTERVAL = 20000;
+const pingInterval = setInterval(() => {
+  wss.clients.forEach(client => {
+    if (!client.isAlive) {
+      verbose && console.log('Terminating unresponsive client');
+      return client.terminate();
+    }
+    client.isAlive = false;
+    client.ping();
+  });
+}, PING_INTERVAL);
 
 // Handler for new strike data
 function handleNewStrike(strike) {
@@ -82,6 +108,8 @@ function shutdown() {
 
   isShuttingDown = true;
   console.log('Shutting down server...');
+
+  clearInterval(pingInterval);
 
   // Close WebSocket server
   console.log('Closing WebSocket server...');
