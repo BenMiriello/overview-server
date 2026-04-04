@@ -11,17 +11,36 @@ const WebSocket = require('ws');
 const { captureBlitzortungData } = require('./lightning_data');
 const { verbose } = require('./utils');
 
-// Compute weighted centroid of recent strikes
+let dobbyscan = null;
+import('dobbyscan').then(m => { dobbyscan = m.default || m; });
+
+// Find the densest cluster of recent strikes using DBSCAN.
+// Returns the recency-weighted centroid of the largest cluster.
+const CLUSTER_RADIUS_KM = 200;
+
 function getHotspot(windowMs = 5 * 60 * 1000) {
+  if (!dobbyscan) return null;
   const cutoff = Date.now() - windowMs;
   const recent = strikes.filter(s => s.timestamp >= cutoff);
   if (recent.length === 0) return null;
 
+  const clusters = dobbyscan(recent, CLUSTER_RADIUS_KM, s => s.lng, s => s.lat);
+
+  if (clusters.length === 0) return null;
+
+  let bestCluster = clusters[0];
+  for (const cluster of clusters) {
+    if (cluster.length > bestCluster.length) {
+      bestCluster = cluster;
+    }
+  }
+
+  // Recency-weighted centroid within the winning cluster
   let totalWeight = 0;
   let weightedLat = 0;
   let weightedLng = 0;
 
-  for (const s of recent) {
+  for (const s of bestCluster) {
     const age = Date.now() - s.timestamp;
     const weight = 1 - (age / windowMs);
     weightedLat += s.lat * weight;
@@ -32,7 +51,7 @@ function getHotspot(windowMs = 5 * 60 * 1000) {
   return {
     lat: weightedLat / totalWeight,
     lng: weightedLng / totalWeight,
-    count: recent.length,
+    count: bestCluster.length,
   };
 }
 
@@ -44,6 +63,11 @@ const server = http.createServer((req, res) => {
       'Access-Control-Allow-Origin': '*',
     });
     const hotspot = getHotspot();
+    if (hotspot) {
+      console.log(`[hotspot] ${hotspot.count} strikes → lat=${hotspot.lat.toFixed(2)}, lng=${hotspot.lng.toFixed(2)}`);
+    } else {
+      console.log('[hotspot] no recent strikes, returning null');
+    }
     res.end(JSON.stringify(hotspot));
     return;
   }

@@ -69,7 +69,7 @@ async function captureBlitzortungData({ onStrikeDetected, isShuttingDown }) {
             };
 
             if (logStreamData && verbose) {
-              console.log('Extracted strike data:', strike);  
+              console.log('Extracted strike data:', strike);
             } else if (logStreamData) {
               console.log('Extracted strike data:', JSON.stringify(strike));
             }
