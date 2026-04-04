@@ -1,6 +1,5 @@
 require('dotenv').config();
 
-// Parse command line arguments
 const args = process.argv.slice(2);
 if (args.includes('--verbose')) {
   process.env.VERBOSE = 'true';
@@ -25,17 +24,13 @@ function getHotspot(windowMs = 5 * 60 * 1000) {
   if (recent.length === 0) return null;
 
   const clusters = dobbyscan(recent, CLUSTER_RADIUS_KM, s => s.lng, s => s.lat);
-
   if (clusters.length === 0) return null;
 
   let bestCluster = clusters[0];
   for (const cluster of clusters) {
-    if (cluster.length > bestCluster.length) {
-      bestCluster = cluster;
-    }
+    if (cluster.length > bestCluster.length) bestCluster = cluster;
   }
 
-  // Recency-weighted centroid within the winning cluster
   let totalWeight = 0;
   let weightedLat = 0;
   let weightedLng = 0;
@@ -53,6 +48,16 @@ function getHotspot(windowMs = 5 * 60 * 1000) {
     lng: weightedLng / totalWeight,
     count: bestCluster.length,
   };
+}
+
+function haversineDistance(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 // Create HTTP server with API routes
@@ -76,27 +81,54 @@ const server = http.createServer((req, res) => {
   res.end('Lightning relay server is running\n');
 });
 
-// Create a WebSocket server for clients to connect to
 const wss = new WebSocket.Server({ server });
 
-// Store captured strikes
 const strikes = [];
 const MAX_STRIKES = 10000;
 let isShuttingDown = false;
 
-// Function to broadcast data to all connected clients
+// Tracked hotspot for change detection
+let currentHotspot = null;
+const HOTSPOT_MIN_DISTANCE_KM = 150;
+const HOTSPOT_INTERVAL_MS = 2 * 60 * 1000;
+
 function broadcastToClients(data) {
+  const payload = JSON.stringify(data);
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(data));
+      client.send(payload);
     }
   });
 }
 
-// Handle client connections
+function updateAndBroadcastHotspot() {
+  const hotspot = getHotspot();
+  if (!hotspot) return;
+
+  let shouldBroadcast = false;
+  if (!currentHotspot) {
+    shouldBroadcast = true;
+  } else {
+    const moved = haversineDistance(currentHotspot.lat, currentHotspot.lng, hotspot.lat, hotspot.lng) > HOTSPOT_MIN_DISTANCE_KM;
+    const surged = hotspot.count > currentHotspot.count * 1.5;
+    shouldBroadcast = moved || surged;
+  }
+
+  if (shouldBroadcast) {
+    currentHotspot = hotspot;
+    console.log(`[hotspot] broadcasting: ${hotspot.count} strikes at lat=${hotspot.lat.toFixed(2)}, lng=${hotspot.lng.toFixed(2)}`);
+    broadcastToClients({ type: 'hotspot', lat: hotspot.lat, lng: hotspot.lng, count: hotspot.count });
+  }
+}
+
 wss.on('connection', (ws) => {
   console.log('Client connected');
   ws.isAlive = true;
+
+  // Send current hotspot immediately so new clients don't have to wait
+  if (currentHotspot) {
+    ws.send(JSON.stringify({ type: 'hotspot', ...currentHotspot }));
+  }
 
   ws.on('pong', () => {
     ws.isAlive = true;
@@ -131,34 +163,33 @@ const pingInterval = setInterval(() => {
   });
 }, PING_INTERVAL);
 
-// Handler for new strike data
 function handleNewStrike(strike) {
-  // Store the strike
   strikes.unshift(strike);
   if (strikes.length > MAX_STRIKES) {
     strikes.pop();
   }
-
-  // Forward to all connected clients
   broadcastToClients(strike);
 }
 
-// Start the server
 const PORT = process.env.PORT || 3001;
 const httpServer = server.listen(PORT, () => {
   console.log(`Lightning relay server running on port ${PORT}`);
   console.log(`Verbose mode: ${verbose ? 'ENABLED' : 'DISABLED'}`);
 
-  // Start capturing WebSocket data
-  captureBlitzortungData({ 
+  const capture = captureBlitzortungData({
     onStrikeDetected: handleNewStrike,
-    isShuttingDown
-  }).catch(err => {
-    console.error('Failed to start WebSocket capture:', err);
+    getIsShuttingDown: () => isShuttingDown,
   });
+
+  // Broadcast hotspot updates every 2 minutes
+  const hotspotInterval = setInterval(updateAndBroadcastHotspot, HOTSPOT_INTERVAL_MS);
+
+  // Extend shutdown to stop capture and hotspot interval
+  const originalShutdown = shutdown;
+  global._captureStop = capture.stop;
+  global._hotspotInterval = hotspotInterval;
 });
 
-// Handle graceful shutdown
 function shutdown() {
   if (isShuttingDown) {
     console.log('Shutdown already in progress');
@@ -170,27 +201,25 @@ function shutdown() {
 
   clearInterval(pingInterval);
 
-  // Close WebSocket server
+  if (global._captureStop) global._captureStop();
+  if (global._hotspotInterval) clearInterval(global._hotspotInterval);
+
   console.log('Closing WebSocket server...');
   wss.close(() => {
     console.log('WebSocket server closed');
 
-    // Close HTTP server
     console.log('Closing HTTP server...');
     httpServer.close(() => {
       console.log('HTTP server closed');
-      console.log('Shutdown complete');
       process.exit(0);
     });
   });
 
-  // Force exit after timeout
   setTimeout(() => {
     console.log('Forcing exit after timeout');
     process.exit(1);
   }, 2000);
 }
 
-// Register shutdown handlers
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
