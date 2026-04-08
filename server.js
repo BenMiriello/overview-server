@@ -6,9 +6,11 @@ if (args.includes('--verbose')) {
 }
 
 const http = require('http');
+const fs = require('fs');
 const WebSocket = require('ws');
 const { captureBlitzortungData } = require('./lightning_data');
 const { verbose } = require('./utils');
+const cloudMirror = require('./cloudMirror');
 
 let dobbyscan = null;
 import('dobbyscan').then(m => { dobbyscan = m.default || m; });
@@ -61,7 +63,33 @@ function haversineDistance(lat1, lng1, lat2, lng2) {
 }
 
 // Create HTTP server with API routes
+const CLOUDS_ROUTE_RE = /^\/api\/clouds\/([a-z0-9]+)(?:\?(.*))?$/;
 const server = http.createServer((req, res) => {
+  const cloudsMatch = req.url.match(CLOUDS_ROUTE_RE);
+  if (cloudsMatch && req.method === 'GET') {
+    const resKey = cloudsMatch[1];
+    const params = new URLSearchParams(cloudsMatch[2] || '');
+    const variant = params.get('previous') === '1' ? 'previous' : 'current';
+    const file = cloudMirror.getCachedFile(resKey, variant)
+      || (variant === 'current' ? cloudMirror.getCachedFile(resKey, 'previous') : null);
+    if (!file) {
+      res.writeHead(503, { 'Access-Control-Allow-Origin': '*' });
+      res.end('Cloud mirror cache empty');
+      return;
+    }
+    const stat = fs.statSync(file);
+    res.writeHead(200, {
+      'Content-Type': 'image/png',
+      'Content-Length': stat.size,
+      'Cache-Control': 'public, max-age=1800',
+      'Last-Modified': stat.mtime.toUTCString(),
+      'Access-Control-Allow-Origin': '*',
+      'X-Cloud-Attribution': cloudMirror.ATTRIBUTION,
+    });
+    fs.createReadStream(file).pipe(res);
+    return;
+  }
+
   if (req.url === '/api/hotspot' && req.method === 'GET') {
     res.writeHead(200, {
       'Content-Type': 'application/json',
@@ -181,6 +209,8 @@ const httpServer = server.listen(PORT, () => {
     getIsShuttingDown: () => isShuttingDown,
   });
 
+  cloudMirror.start().catch(err => console.error('[cloudMirror] start failed:', err));
+
   // Broadcast hotspot updates every 2 minutes
   const hotspotInterval = setInterval(updateAndBroadcastHotspot, HOTSPOT_INTERVAL_MS);
 
@@ -203,6 +233,7 @@ function shutdown() {
 
   if (global._captureStop) global._captureStop();
   if (global._hotspotInterval) clearInterval(global._hotspotInterval);
+  cloudMirror.stop();
 
   console.log('Closing WebSocket server...');
   wss.close(() => {
