@@ -23,7 +23,7 @@ function captureBlitzortungData({ onStrikeDetected, getIsShuttingDown }) {
   async function start() {
     if (stopped) return;
 
-    console.log('Launching browser...');
+    console.log('Launching virtual browser...');
     let browser;
     try {
       browser = await puppeteer.launch({
@@ -31,7 +31,7 @@ function captureBlitzortungData({ onStrikeDetected, getIsShuttingDown }) {
         args: ['--no-sandbox', '--disable-setuid-sandbox'],
       });
     } catch (err) {
-      console.error('Failed to launch browser:', err.message);
+      console.error('Failed to launch virtual browser:', err.message);
       scheduleRestart(10_000);
       return;
     }

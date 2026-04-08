@@ -8,7 +8,6 @@
         "start:verbose": "VERBOSE=true node server.js"
     },
     "dependencies": {
-        "dobbyscan": "^2.0.0",
         "dotenv": "^16.5.0",
         "puppeteer": "^22.1.0",
         "ws": "^8.13.0"
