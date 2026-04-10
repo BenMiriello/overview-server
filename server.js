@@ -12,44 +12,70 @@ const { captureBlitzortungData } = require('./lightning_data');
 const { verbose } = require('./utils');
 const cloudMirror = require('./cloudMirror');
 
-let dobbyscan = null;
-import('dobbyscan').then(m => { dobbyscan = m.default || m; });
+// Find the densest cluster of recent strikes by density-peak search.
+// Returns the recency-weighted centroid of strikes within CLUSTER_RADIUS_KM of the peak.
+const CLUSTER_RADIUS_KM = 150;
+const MIN_CLUSTER_SIZE = 5;
 
-// Find the densest cluster of recent strikes using DBSCAN.
-// Returns the recency-weighted centroid of the largest cluster.
-const CLUSTER_RADIUS_KM = 200;
+// Blitzortung reports each lightning bolt once per detecting sensor station, so a
+// single bolt can appear 5-20 times in the feed within milliseconds. Collapsing
+// these duplicates before clustering prevents a single well-covered bolt from
+// winning over a genuine multi-bolt storm.
+const DEDUP_RADIUS_KM = 10;
+const DEDUP_TIME_MS   = 2000;
 
-function getHotspot(windowMs = 5 * 60 * 1000) {
-  if (!dobbyscan) return null;
+function deduplicateStrikes(strikesArr) {
+  const out = [];
+  for (const s of strikesArr) {
+    const isDup = out.some(o =>
+      Math.abs(o.timestamp - s.timestamp) < DEDUP_TIME_MS &&
+      haversineDistance(o.lat, o.lng, s.lat, s.lng) < DEDUP_RADIUS_KM
+    );
+    if (!isDup) out.push(s);
+  }
+  return out;
+}
+
+function getHotspotForWindow(windowMs) {
   const cutoff = Date.now() - windowMs;
-  const recent = strikes.filter(s => s.timestamp >= cutoff);
-  if (recent.length === 0) return null;
+  const recent = deduplicateStrikes(strikes.filter(s => s.timestamp >= cutoff));
+  if (recent.length < MIN_CLUSTER_SIZE) return null;
 
-  const clusters = dobbyscan(recent, CLUSTER_RADIUS_KM, s => s.lng, s => s.lat);
-  if (clusters.length === 0) return null;
-
-  let bestCluster = clusters[0];
-  for (const cluster of clusters) {
-    if (cluster.length > bestCluster.length) bestCluster = cluster;
+  // Find the strike with the most neighbors within CLUSTER_RADIUS_KM (density peak).
+  // Beats the old connected-component approach which defaulted to the oldest recent
+  // strike when all clusters were size-1 (sparse/scattered activity).
+  let peakIdx = 0;
+  let peakCount = 0;
+  for (let i = 0; i < recent.length; i++) {
+    let count = 0;
+    for (let j = 0; j < recent.length; j++) {
+      if (i !== j && haversineDistance(recent[i].lat, recent[i].lng, recent[j].lat, recent[j].lng) <= CLUSTER_RADIUS_KM) {
+        count++;
+      }
+    }
+    if (count > peakCount) { peakCount = count; peakIdx = i; }
   }
 
-  let totalWeight = 0;
-  let weightedLat = 0;
-  let weightedLng = 0;
+  if (peakCount + 1 < MIN_CLUSTER_SIZE) return null;
 
-  for (const s of bestCluster) {
-    const age = Date.now() - s.timestamp;
-    const weight = 1 - (age / windowMs);
-    weightedLat += s.lat * weight;
-    weightedLng += s.lng * weight;
-    totalWeight += weight;
-  }
+  const center = recent[peakIdx];
+  const clusterSize = recent.filter(s =>
+    haversineDistance(center.lat, center.lng, s.lat, s.lng) <= CLUSTER_RADIUS_KM
+  ).length;
 
+  // Return the density peak's own coordinates. A centroid can land in empty
+  // space between sub-clusters; the peak is always at an actual strike location.
   return {
-    lat: weightedLat / totalWeight,
-    lng: weightedLng / totalWeight,
-    count: bestCluster.length,
+    lat: center.lat,
+    lng: center.lng,
+    count: clusterSize,
   };
+}
+
+// Try fresh 30s window first; if no activity, fall back to 5-minute window.
+// This prevents button clicks returning null during brief lulls in strike data.
+function getHotspot() {
+  return getHotspotForWindow(30 * 1000) ?? getHotspotForWindow(5 * 60 * 1000);
 }
 
 function haversineDistance(lat1, lng1, lat2, lng2) {
@@ -87,6 +113,27 @@ const server = http.createServer((req, res) => {
       'X-Cloud-Attribution': cloudMirror.ATTRIBUTION,
     });
     fs.createReadStream(file).pipe(res);
+    return;
+  }
+
+  if (req.url === '/api/hotspot/debug' && req.method === 'GET') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    });
+    const windowMs = 5 * 60 * 1000;
+    const cutoff = Date.now() - windowMs;
+    const recent = deduplicateStrikes(strikes.filter(s => s.timestamp >= cutoff));
+    const hotspot30 = getHotspotForWindow(30 * 1000);
+    const hotspot5m = getHotspotForWindow(5 * 60 * 1000);
+    res.end(JSON.stringify({
+      totalStrikes: strikes.length,
+      recentStrikes5m: recent.length,
+      hotspot30s: hotspot30,
+      hotspot5m: hotspot5m,
+      currentHotspot,
+      sample: recent.slice(0, 20).map(s => ({ lat: s.lat, lng: s.lng, age: Date.now() - s.timestamp })),
+    }, null, 2));
     return;
   }
 
