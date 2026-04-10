@@ -116,27 +116,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.url === '/api/hotspot/debug' && req.method === 'GET') {
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-    });
-    const windowMs = 5 * 60 * 1000;
-    const cutoff = Date.now() - windowMs;
-    const recent = deduplicateStrikes(strikes.filter(s => s.timestamp >= cutoff));
-    const hotspot30 = getHotspotForWindow(30 * 1000);
-    const hotspot5m = getHotspotForWindow(5 * 60 * 1000);
-    res.end(JSON.stringify({
-      totalStrikes: strikes.length,
-      recentStrikes5m: recent.length,
-      hotspot30s: hotspot30,
-      hotspot5m: hotspot5m,
-      currentHotspot,
-      sample: recent.slice(0, 20).map(s => ({ lat: s.lat, lng: s.lng, age: Date.now() - s.timestamp })),
-    }, null, 2));
-    return;
-  }
-
   if (req.url === '/api/hotspot' && req.method === 'GET') {
     res.writeHead(200, {
       'Content-Type': 'application/json',
@@ -200,9 +179,12 @@ wss.on('connection', (ws) => {
   console.log('Client connected');
   ws.isAlive = true;
 
-  // Send current hotspot immediately so new clients don't have to wait
-  if (currentHotspot) {
-    ws.send(JSON.stringify({ type: 'hotspot', ...currentHotspot }));
+  // Send best available hotspot immediately — don't make new clients wait up to
+  // 2 minutes for the broadcast interval. Use currentHotspot if already computed,
+  // otherwise compute fresh from available strike data.
+  const spotForNewClient = currentHotspot ?? getHotspot();
+  if (spotForNewClient) {
+    ws.send(JSON.stringify({ type: 'hotspot', ...spotForNewClient }));
   }
 
   ws.on('pong', () => {
