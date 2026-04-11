@@ -33,6 +33,10 @@ RUN npm ci --omit=dev
 
 COPY . .
 
+# Remove the chromium extensions hook — it forks subprocesses during launch
+# which fails in containers with low nproc limits, preventing Chromium from starting.
+RUN rm -f /etc/chromium.d/extensions
+
 EXPOSE 3001
 
 CMD ["node", "server.js"]
