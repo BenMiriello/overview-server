@@ -11,6 +11,7 @@ const WebSocket = require('ws');
 const { captureBlitzortungData } = require('./lightning_data');
 const { verbose } = require('./utils');
 const cloudMirror = require('./cloudMirror');
+const temperatureCache = require('./temperatureCache');
 
 // Find the densest cluster of recent strikes by density-peak search.
 // Returns the recency-weighted centroid of strikes within CLUSTER_RADIUS_KM of the peak.
@@ -122,6 +123,26 @@ const server = http.createServer((req, res) => {
       'X-Cloud-Attribution': cloudMirror.ATTRIBUTION,
     });
     fs.createReadStream(file).pipe(res);
+    return;
+  }
+
+  if (req.url.startsWith('/api/temperature') && req.method === 'GET') {
+    temperatureCache.getTemperatureGrid()
+      .then(({ temps, fetchedAt, runId }) => {
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=21600, stale-while-revalidate=21600',  // 6h = one GFS cycle
+          'X-Fetched-At': new Date(fetchedAt).toISOString(),
+          'X-GFS-Run': runId || '',
+        });
+        res.end(JSON.stringify(temps));
+      })
+      .catch(err => {
+        console.error('[temperature] error:', err.message);
+        res.writeHead(503, { 'Access-Control-Allow-Origin': '*' });
+        res.end('Temperature data unavailable');
+      });
     return;
   }
 

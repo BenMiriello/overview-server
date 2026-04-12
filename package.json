@@ -9,6 +9,7 @@
     },
     "dependencies": {
         "dotenv": "^16.5.0",
+        "grib2-simple": "^1.1.1",
         "puppeteer": "^22.1.0",
         "ws": "^8.13.0"
     }
