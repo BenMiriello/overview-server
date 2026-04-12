@@ -78,6 +78,15 @@ function getHotspot() {
   return getHotspotForWindow(30 * 1000) ?? getHotspotForWindow(5 * 60 * 1000);
 }
 
+// Returns currentHotspot if it was captured within HOTSPOT_MAX_AGE_MS, else null.
+// Used as a fallback when capture is paused and getHotspot() finds no recent strikes.
+function getFreshHotspot() {
+  if (!currentHotspot) return null;
+  if (Date.now() - currentHotspot.capturedAt > HOTSPOT_MAX_AGE_MS) return null;
+  const { lat, lng, count } = currentHotspot;
+  return { lat, lng, count };
+}
+
 function haversineDistance(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -121,7 +130,7 @@ const server = http.createServer((req, res) => {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
     });
-    const hotspot = getHotspot();
+    const hotspot = getHotspot() ?? getFreshHotspot();
     if (hotspot) {
       console.log(`[hotspot] ${hotspot.count} strikes → lat=${hotspot.lat.toFixed(2)}, lng=${hotspot.lng.toFixed(2)}`);
     } else {
@@ -146,6 +155,13 @@ let currentHotspot = null;
 const HOTSPOT_MIN_DISTANCE_KM = 150;
 const HOTSPOT_INTERVAL_MS = 2 * 60 * 1000;
 
+const CAPTURE_IDLE_TIMEOUT_MS = 10 * 60 * 1000; // stop capture 10 min after last client leaves
+const HOTSPOT_MAX_AGE_MS      = 60 * 60 * 1000; // serve cached hotspot only if < 60 min old
+
+let captureRunning     = false;
+let capture            = null;
+let captureIdleTimeout = null;
+
 function broadcastToClients(data) {
   const payload = JSON.stringify(data);
   wss.clients.forEach(client => {
@@ -169,20 +185,55 @@ function updateAndBroadcastHotspot() {
   }
 
   if (shouldBroadcast) {
-    currentHotspot = hotspot;
+    currentHotspot = { lat: hotspot.lat, lng: hotspot.lng, count: hotspot.count, capturedAt: Date.now() };
     console.log(`[hotspot] broadcasting: ${hotspot.count} strikes at lat=${hotspot.lat.toFixed(2)}, lng=${hotspot.lng.toFixed(2)}`);
     broadcastToClients({ type: 'hotspot', lat: hotspot.lat, lng: hotspot.lng, count: hotspot.count });
   }
 }
 
+function startCapture() {
+  if (captureRunning || isShuttingDown) return;
+  captureRunning = true;
+  capture = captureBlitzortungData({
+    onStrikeDetected: handleNewStrike,
+    getIsShuttingDown: () => isShuttingDown,
+  });
+  global._captureStop = capture.stop;
+}
+
+function stopCapture() {
+  if (!captureRunning) return;
+  console.log('[capture] No clients for 10 min — stopping Puppeteer');
+  if (capture) { capture.stop(); capture = null; }
+  global._captureStop = null;
+  captureRunning = false;
+}
+
+function onClientConnected() {
+  if (captureIdleTimeout !== null) {
+    clearTimeout(captureIdleTimeout);
+    captureIdleTimeout = null;
+  }
+  startCapture();
+}
+
+function onClientDisconnected() {
+  if (wss.clients.size === 0) {
+    captureIdleTimeout = setTimeout(() => {
+      captureIdleTimeout = null;
+      stopCapture();
+    }, CAPTURE_IDLE_TIMEOUT_MS);
+  }
+}
+
 wss.on('connection', (ws) => {
   console.log('Client connected');
+  onClientConnected();
   ws.isAlive = true;
 
-  // Send best available hotspot immediately — don't make new clients wait up to
-  // 2 minutes for the broadcast interval. Use currentHotspot if already computed,
-  // otherwise compute fresh from available strike data.
-  const spotForNewClient = currentHotspot ?? getHotspot();
+  // Prefer a live computation from recent strikes; fall back to cached hotspot if
+  // capture just restarted (strikes array empty) but we have a recent enough cache.
+  const spotForNewClient = getHotspot() ?? getFreshHotspot();
   if (spotForNewClient) {
     ws.send(JSON.stringify({ type: 'hotspot', ...spotForNewClient }));
   }
@@ -204,6 +255,7 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     console.log('Client disconnected');
+    onClientDisconnected();
   });
 });
 
@@ -233,19 +285,10 @@ const httpServer = server.listen(PORT, () => {
   console.log(`Lightning relay server running on port ${PORT}`);
   console.log(`Verbose mode: ${verbose ? 'ENABLED' : 'DISABLED'}`);
 
-  const capture = captureBlitzortungData({
-    onStrikeDetected: handleNewStrike,
-    getIsShuttingDown: () => isShuttingDown,
-  });
-
   cloudMirror.start().catch(err => console.error('[cloudMirror] start failed:', err));
 
   // Broadcast hotspot updates every 2 minutes
   const hotspotInterval = setInterval(updateAndBroadcastHotspot, HOTSPOT_INTERVAL_MS);
-
-  // Extend shutdown to stop capture and hotspot interval
-  const originalShutdown = shutdown;
-  global._captureStop = capture.stop;
   global._hotspotInterval = hotspotInterval;
 });
 
@@ -260,6 +303,10 @@ function shutdown() {
 
   clearInterval(pingInterval);
 
+  if (captureIdleTimeout !== null) {
+    clearTimeout(captureIdleTimeout);
+    captureIdleTimeout = null;
+  }
   if (global._captureStop) global._captureStop();
   if (global._hotspotInterval) clearInterval(global._hotspotInterval);
   cloudMirror.stop();
