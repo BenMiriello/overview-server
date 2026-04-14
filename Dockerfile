@@ -1,7 +1,7 @@
 FROM node:20-bookworm-slim
 
 RUN apt-get update && apt-get install -y \
-  eccodes \
+  libeccodes-tools \
   chromium \
   fonts-liberation \
   libatk-bridge2.0-0 \
