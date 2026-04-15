@@ -13,6 +13,7 @@ const { verbose } = require('./utils');
 const cloudMirror = require('./cloudMirror');
 const temperatureCache = require('./temperatureCache');
 const precipitationCache = require('./precipitationCache');
+const windCache = require('./windCache');
 
 // Find the densest cluster of recent strikes by density-peak search.
 // Returns the recency-weighted centroid of strikes within CLUSTER_RADIUS_KM of the peak.
@@ -128,12 +129,55 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.url.startsWith('/api/temperature') && req.method === 'GET') {
+    const tempFramesMatch = req.url === '/api/temperature/frames';
+    const tempFrameMatch = req.url.match(/^\/api\/temperature\/(\d{8}_\d{2})$/);
+
+    if (tempFramesMatch) {
+      temperatureCache.getFrameList()
+        .then(frames => {
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=300',
+          });
+          res.end(JSON.stringify(frames));
+        })
+        .catch(err => {
+          console.error('[temperature] frames error:', err.message);
+          res.writeHead(503, { 'Access-Control-Allow-Origin': '*' });
+          res.end('Temperature frame list unavailable');
+        });
+      return;
+    }
+
+    if (tempFrameMatch) {
+      const runId = tempFrameMatch[1].replace('_', '/');
+      temperatureCache.getFrame(runId)
+        .then(({ temps, fetchedAt, runId: rid }) => {
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=86400',
+            'X-Fetched-At': new Date(fetchedAt).toISOString(),
+            'X-GFS-Run': rid || '',
+          });
+          res.end(JSON.stringify(temps));
+        })
+        .catch(err => {
+          console.error('[temperature] frame error:', err.message);
+          res.writeHead(404, { 'Access-Control-Allow-Origin': '*' });
+          res.end('Temperature frame not found');
+        });
+      return;
+    }
+
+    // Default: latest frame (backward compatible — returns raw array)
     temperatureCache.getTemperatureGrid()
       .then(({ temps, fetchedAt, runId }) => {
         res.writeHead(200, {
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*',
-          'Cache-Control': 'public, max-age=21600, stale-while-revalidate=21600',  // 6h = one GFS cycle
+          'Cache-Control': 'public, max-age=21600, stale-while-revalidate=21600',
           'X-Fetched-At': new Date(fetchedAt).toISOString(),
           'X-GFS-Run': runId || '',
         });
@@ -207,6 +251,69 @@ const server = http.createServer((req, res) => {
         console.error('[precipitation] error:', err.message);
         res.writeHead(503, { 'Access-Control-Allow-Origin': '*' });
         res.end('Precipitation data unavailable');
+      });
+    return;
+  }
+
+  // Wind API — 3 endpoints
+  if (req.url.startsWith('/api/wind') && req.method === 'GET') {
+    const windFramesMatch = req.url === '/api/wind/frames';
+    const windFrameMatch = req.url.match(/^\/api\/wind\/(\d{8}_\d{2})$/);
+
+    if (windFramesMatch) {
+      windCache.getFrameList()
+        .then(frames => {
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=300',
+          });
+          res.end(JSON.stringify(frames));
+        })
+        .catch(err => {
+          console.error('[wind] frames error:', err.message);
+          res.writeHead(503, { 'Access-Control-Allow-Origin': '*' });
+          res.end('Wind frame list unavailable');
+        });
+      return;
+    }
+
+    if (windFrameMatch) {
+      const runId = windFrameMatch[1].replace('_', '/');
+      windCache.getFrame(runId)
+        .then(({ u, v, fetchedAt, runId: rid }) => {
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=86400',
+            'X-Fetched-At': new Date(fetchedAt).toISOString(),
+            'X-GFS-Run': rid || '',
+          });
+          res.end(JSON.stringify({ u, v }));
+        })
+        .catch(err => {
+          console.error('[wind] frame error:', err.message);
+          res.writeHead(404, { 'Access-Control-Allow-Origin': '*' });
+          res.end('Wind frame not found');
+        });
+      return;
+    }
+
+    windCache.getLatestFrame()
+      .then(({ u, v, fetchedAt, runId }) => {
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=21600, stale-while-revalidate=21600',
+          'X-Fetched-At': new Date(fetchedAt).toISOString(),
+          'X-GFS-Run': runId || '',
+        });
+        res.end(JSON.stringify({ u, v }));
+      })
+      .catch(err => {
+        console.error('[wind] error:', err.message);
+        res.writeHead(503, { 'Access-Control-Allow-Origin': '*' });
+        res.end('Wind data unavailable');
       });
     return;
   }

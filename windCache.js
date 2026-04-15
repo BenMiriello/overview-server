@@ -1,7 +1,7 @@
-// Fetches NOAA GFS 2m temperature once per model cycle (~6h), caches to disk.
+// Fetches NOAA GFS 10m wind (U/V components) per model cycle (~6h), caches to disk.
 // Keeps 72 hours of history for timeline playback with automatic backfill.
-// Client hits /api/temperature for latest, /api/temperature/frames for frame list,
-// /api/temperature/:runId for a specific historical frame.
+// Client hits /api/wind for latest, /api/wind/frames for frame list,
+// /api/wind/:runId for a specific historical frame.
 //
 // Requires: eccodes package (provides grib_get_data binary)
 //   macOS:  brew install eccodes
@@ -13,8 +13,7 @@ const path = require('path');
 const os = require('os');
 const { execFile } = require('child_process');
 
-const CACHE_DIR = path.join(__dirname, 'cache', 'temperature');
-const LEGACY_CACHE_FILE = path.join(__dirname, 'cache', 'temperature.json');
+const CACHE_DIR = path.join(__dirname, 'cache', 'wind');
 const GFS_DELAY_MS = 3.5 * 60 * 60 * 1000;
 const POLL_INTERVAL_MS = 30 * 60 * 1000;
 const HISTORY_MS = 72 * 60 * 60 * 1000;
@@ -27,7 +26,7 @@ const LNG_STEP = 0.25;
 const GFS_W = 1440;
 const GFS_H = 721;
 
-let latestCache = null;  // { temps, fetchedAt, runId }
+let latestCache = null;  // { u, v, fetchedAt, runId }
 let fetchInFlight = null;
 
 function formatDate(d) {
@@ -68,7 +67,8 @@ function getLatestAvailableRun() {
 async function fetchGFS(date, hour) {
   const url = `https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl` +
     `?file=gfs.t${hour}z.pgrb2.0p25.f000` +
-    `&var_TMP=on&lev_2_m_above_ground=on` +
+    `&var_UGRD=on&var_VGRD=on` +
+    `&lev_10_m_above_ground=on` +
     `&dir=/gfs.${date}/${hour}/atmos`;
 
   const res = await fetch(url);
@@ -76,7 +76,7 @@ async function fetchGFS(date, hour) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-function parseGribGetDataOutput(stdout) {
+function parseGribField(stdout) {
   const grid = new Float32Array(GFS_W * GFS_H);
   const buf = Buffer.from(stdout);
   let lineStart = 0;
@@ -92,7 +92,7 @@ function parseGribGetDataOutput(stdout) {
         } else if (line && pointIdx < GFS_W * GFS_H) {
           const lastSpace = line.lastIndexOf(' ');
           const val = parseFloat(line.slice(lastSpace + 1));
-          grid[pointIdx++] = isFinite(val) ? val : 273.15;
+          grid[pointIdx++] = isFinite(val) ? val : 0;
         }
       }
       lineStart = i + 1;
@@ -105,43 +105,51 @@ function parseGribGetDataOutput(stdout) {
   return grid;
 }
 
+function extractGribField(tmpFile, shortName) {
+  return new Promise((resolve, reject) => {
+    execFile('grib_get_data', ['-w', `shortName=${shortName}`, '-F', '%.4g', tmpFile],
+      { maxBuffer: 80 * 1024 * 1024 },
+      (err, out, stderr) => {
+        if (err) reject(new Error(`grib_get_data (${shortName}) failed: ${err.message}${stderr ? ' | ' + stderr.trim() : ''}`));
+        else resolve(parseGribField(out));
+      }
+    );
+  });
+}
+
+function transformGrid(gfsGrid) {
+  const out = new Array(GRID_SIZE);
+  for (let outRow = 0; outRow < GRID_H; outRow++) {
+    const gfsRow = (GRID_H - 1 - outRow);
+    for (let outCol = 0; outCol < GRID_W; outCol++) {
+      const gfsLng = (((outCol * LNG_STEP - 90) % 360) + 360) % 360;
+      const gfsCol = Math.round(gfsLng * 4) % GFS_W;
+      const val = gfsGrid[gfsRow * GFS_W + gfsCol];
+      out[outRow * GRID_W + outCol] = Math.round(val * 10) / 10;
+    }
+  }
+  return out;
+}
+
 async function decodeGrib2(buffer) {
-  const tmpFile = path.join(os.tmpdir(), `gfs_${Date.now()}.grib2`);
+  const tmpFile = path.join(os.tmpdir(), `gfs_wind_${Date.now()}.grib2`);
   await fsp.writeFile(tmpFile, buffer);
 
   try {
-    const stdout = await new Promise((resolve, reject) => {
-      execFile('grib_get_data', ['-F', '%.4g', tmpFile],
-        { maxBuffer: 80 * 1024 * 1024 },
-        (err, out, stderr) => {
-          if (err) reject(new Error(`grib_get_data failed: ${err.message}${stderr ? ' | ' + stderr.trim() : ''}`));
-          else resolve(out);
-        }
-      );
-    });
-
-    const gfsGrid = parseGribGetDataOutput(stdout);
-
-    const out = new Array(GRID_W * GRID_H);
-    for (let outRow = 0; outRow < GRID_H; outRow++) {
-      const gfsRow = (GRID_H - 1 - outRow);
-      for (let outCol = 0; outCol < GRID_W; outCol++) {
-        const gfsLng = (((outCol * LNG_STEP - 90) % 360) + 360) % 360;
-        const gfsCol = Math.round(gfsLng * 4) % GFS_W;
-        const kelvin = gfsGrid[gfsRow * GFS_W + gfsCol];
-        out[outRow * GRID_W + outCol] = Math.round((kelvin - 273.15) * 10) / 10;
-      }
-    }
-    return out;
+    const [uGfs, vGfs] = await Promise.all([
+      extractGribField(tmpFile, '10u'),
+      extractGribField(tmpFile, '10v'),
+    ]);
+    return { u: transformGrid(uGfs), v: transformGrid(vGfs) };
   } finally {
     fsp.unlink(tmpFile).catch(() => {});
   }
 }
 
-async function saveFrame(runId, temps, fetchedAt) {
+async function saveFrame(runId, u, v, fetchedAt) {
   await fsp.mkdir(CACHE_DIR, { recursive: true });
   const filepath = path.join(CACHE_DIR, runIdToFilename(runId));
-  const data = { temps, fetchedAt, runId };
+  const data = { u, v, fetchedAt, runId };
   await fsp.writeFile(filepath, JSON.stringify(data));
   return data;
 }
@@ -156,7 +164,7 @@ async function cleanupOldFrames() {
       const ts = runIdToTimestamp(runId);
       if (ts < cutoff) {
         await fsp.unlink(path.join(CACHE_DIR, f)).catch(() => {});
-        console.log(`[temperature] cleaned up old frame: ${runId}`);
+        console.log(`[wind] cleaned up old frame: ${runId}`);
       }
     }
   } catch {
@@ -166,13 +174,13 @@ async function cleanupOldFrames() {
 
 async function refresh(run) {
   const runId = `${run.date}/${run.hour}`;
-  console.log(`[temperature] fetching GFS run ${runId}...`);
+  console.log(`[wind] fetching GFS run ${runId}...`);
   const buffer = await fetchGFS(run.date, run.hour);
-  console.log(`[temperature] downloaded ${(buffer.length / 1024).toFixed(0)}KB, decoding with grib_get_data...`);
-  const temps = await decodeGrib2(buffer);
+  console.log(`[wind] downloaded ${(buffer.length / 1024).toFixed(0)}KB, decoding U/V fields...`);
+  const { u, v } = await decodeGrib2(buffer);
   const fetchedAt = Date.now();
-  const frame = await saveFrame(runId, temps, fetchedAt);
-  console.log(`[temperature] cached ${temps.length} points (run ${runId})`);
+  const frame = await saveFrame(runId, u, v, fetchedAt);
+  console.log(`[wind] cached ${u.length} points (run ${runId})`);
   return frame;
 }
 
@@ -213,11 +221,11 @@ async function backfillMissing() {
     try {
       if (await fetchIfMissing(cycle)) filled++;
     } catch (err) {
-      console.error(`[temperature] backfill ${cycle.runId} failed:`, err.message);
+      console.error(`[wind] backfill ${cycle.runId} failed:`, err.message);
     }
   }
   if (filled > 0) {
-    console.log(`[temperature] backfilled ${filled} missing frame(s)`);
+    console.log(`[wind] backfilled ${filled} missing frame(s)`);
   }
 }
 
@@ -234,15 +242,15 @@ async function poll() {
         await fsp.access(filepath);
         const raw = await fsp.readFile(filepath, 'utf8');
         const parsed = JSON.parse(raw);
-        if (parsed.temps?.length === GRID_SIZE) {
+        if (parsed.u?.length === GRID_SIZE) {
           latestCache = parsed;
-          console.log(`[temperature] loaded from disk cache (run ${runId})`);
+          console.log(`[wind] loaded from disk cache (run ${runId})`);
         }
       } catch {
         try {
           latestCache = await refresh(run);
         } catch (err) {
-          console.error(`[temperature] fetch failed (${runId}):`, err.message);
+          console.error(`[wind] fetch failed (${runId}):`, err.message);
         }
       }
     }
@@ -255,40 +263,18 @@ async function poll() {
 }
 
 function loadLatestDiskCache() {
-  // Try new directory format first
   try {
     const files = fs.readdirSync(CACHE_DIR).filter(f => f.endsWith('.json')).sort();
-    if (files.length > 0) {
-      const latest = files[files.length - 1];
-      const raw = fs.readFileSync(path.join(CACHE_DIR, latest), 'utf8');
-      const parsed = JSON.parse(raw);
-      if (parsed.temps?.length === GRID_SIZE) {
-        latestCache = parsed;
-        console.log(`[temperature] loaded disk cache (run ${parsed.runId}, ${parsed.temps.length} points)`);
-        return;
-      }
-    }
-  } catch {
-    // dir may not exist yet
-  }
-
-  // Fall back to legacy single-file format and migrate
-  try {
-    const raw = fs.readFileSync(LEGACY_CACHE_FILE, 'utf8');
+    if (files.length === 0) return;
+    const latest = files[files.length - 1];
+    const raw = fs.readFileSync(path.join(CACHE_DIR, latest), 'utf8');
     const parsed = JSON.parse(raw);
-    if (parsed.temps?.length === GRID_SIZE && parsed.runId) {
+    if (parsed.u?.length === GRID_SIZE) {
       latestCache = parsed;
-      console.log(`[temperature] loaded legacy cache (run ${parsed.runId}), migrating...`);
-      fs.mkdirSync(CACHE_DIR, { recursive: true });
-      fs.writeFileSync(
-        path.join(CACHE_DIR, runIdToFilename(parsed.runId)),
-        raw
-      );
-      fs.unlinkSync(LEGACY_CACHE_FILE);
-      console.log(`[temperature] migrated legacy cache to ${CACHE_DIR}`);
+      console.log(`[wind] loaded disk cache (run ${parsed.runId}, ${parsed.u.length} points)`);
     }
   } catch {
-    // No legacy cache
+    // No cache yet
   }
 }
 
@@ -296,11 +282,11 @@ loadLatestDiskCache();
 poll();
 const _pollTimer = setInterval(poll, POLL_INTERVAL_MS);
 
-async function getTemperatureGrid() {
+async function getLatestFrame() {
   if (latestCache) return latestCache;
   if (fetchInFlight) return fetchInFlight;
   fetchInFlight = poll().then(() => {
-    if (!latestCache) throw new Error('Temperature data not yet available — GFS fetch in progress');
+    if (!latestCache) throw new Error('Wind data not yet available — GFS fetch in progress');
     return latestCache;
   }).finally(() => { fetchInFlight = null; });
   return fetchInFlight;
@@ -322,10 +308,10 @@ async function getFrame(runId) {
   const filepath = path.join(CACHE_DIR, runIdToFilename(runId));
   const raw = await fsp.readFile(filepath, 'utf8');
   const parsed = JSON.parse(raw);
-  if (parsed.temps?.length !== GRID_SIZE) {
-    throw new Error(`Frame ${runId} has wrong grid size: ${parsed.temps?.length}`);
+  if (parsed.u?.length !== GRID_SIZE) {
+    throw new Error(`Frame ${runId} has wrong grid size: ${parsed.u?.length}`);
   }
   return parsed;
 }
 
-module.exports = { getTemperatureGrid, getFrameList, getFrame, GRID_W, GRID_H };
+module.exports = { getLatestFrame, getFrameList, getFrame, GRID_W, GRID_H };
