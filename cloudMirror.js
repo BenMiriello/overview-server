@@ -8,7 +8,10 @@ const path = require('path');
 
 const UPSTREAM = 'https://clouds.matteason.co.uk/images';
 const CACHE_DIR = path.join(__dirname, 'cache');
-const POLL_INTERVAL_MS = 30 * 60 * 1000; // 30 min — upstream refreshes every 3 h, this catches it within ~half a cycle.
+const HISTORY_DIR = path.join(CACHE_DIR, 'clouds-history');
+const HISTORY_RES = '4k';
+const HISTORY_MS = 72 * 60 * 60 * 1000;
+const POLL_INTERVAL_MS = 30 * 60 * 1000;
 const ATTRIBUTION = 'Contains modified EUMETSAT data via matteason/live-cloud-maps (CC0)';
 
 const RESOLUTIONS = {
@@ -19,7 +22,6 @@ const RESOLUTIONS = {
 };
 
 const state = {
-  // Per-resolution: { etag, lastModified, lastFetchedAt, lastSuccessAt }
   meta: {},
 };
 
@@ -30,6 +32,7 @@ function cachePath(res, variant = 'current') {
 
 async function ensureCacheDir() {
   await fsp.mkdir(CACHE_DIR, { recursive: true });
+  await fsp.mkdir(HISTORY_DIR, { recursive: true });
 }
 
 async function fetchOne(resKey) {
@@ -63,26 +66,59 @@ async function fetchOne(resKey) {
   const previous = cachePath(resKey, 'previous');
   const tmp = `${current}.tmp`;
 
-  // Promote current → previous so we always have one good fallback on disk.
   try { await fsp.rename(current, previous); } catch (_) { /* first run */ }
   await fsp.writeFile(tmp, buf);
   await fsp.rename(tmp, current);
 
+  const lastModified = res.headers.get('last-modified') || undefined;
+
   state.meta[resKey] = {
     etag: res.headers.get('etag') || undefined,
-    lastModified: res.headers.get('last-modified') || undefined,
+    lastModified,
     lastFetchedAt: Date.now(),
     lastSuccessAt: Date.now(),
     bytes: buf.length,
   };
   console.log(`[cloudMirror] ${resKey} updated (${buf.length} bytes)`);
+
+  // Save history snapshot for the history resolution
+  if (resKey === HISTORY_RES) {
+    const ts = lastModified ? new Date(lastModified).getTime() : Date.now();
+    // Round to nearest 3 hours to avoid duplicates from polling
+    const rounded = Math.round(ts / (3 * 60 * 60 * 1000)) * (3 * 60 * 60 * 1000);
+    const histFile = path.join(HISTORY_DIR, `${rounded}.png`);
+    try {
+      await fsp.access(histFile);
+      // Already have this snapshot
+    } catch {
+      await fsp.writeFile(histFile, buf);
+      console.log(`[cloudMirror] history snapshot saved: ${rounded}`);
+    }
+  }
+
   return { ok: true, changed: true };
+}
+
+async function cleanupHistory() {
+  try {
+    const files = await fsp.readdir(HISTORY_DIR);
+    const cutoff = Date.now() - HISTORY_MS;
+    for (const f of files) {
+      if (!f.endsWith('.png')) continue;
+      const ts = parseInt(f.replace('.png', ''), 10);
+      if (!isFinite(ts) || ts < cutoff) {
+        await fsp.unlink(path.join(HISTORY_DIR, f)).catch(() => {});
+        console.log(`[cloudMirror] cleaned up old history: ${f}`);
+      }
+    }
+  } catch { /* dir may not exist */ }
 }
 
 async function pollAll() {
   for (const key of Object.keys(RESOLUTIONS)) {
     await fetchOne(key);
   }
+  await cleanupHistory();
 }
 
 let pollTimer = null;
@@ -108,11 +144,32 @@ function getMeta(resKey) {
   return state.meta[resKey] || null;
 }
 
+async function getCloudFrameList() {
+  try {
+    const files = (await fsp.readdir(HISTORY_DIR))
+      .filter(f => f.endsWith('.png'))
+      .sort();
+    return files.map(f => ({
+      timestamp: parseInt(f.replace('.png', ''), 10),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function getCloudFrame(timestamp) {
+  const file = path.join(HISTORY_DIR, `${timestamp}.png`);
+  if (!fs.existsSync(file)) return null;
+  return file;
+}
+
 module.exports = {
   start,
   stop,
   getCachedFile,
   getMeta,
+  getCloudFrameList,
+  getCloudFrame,
   ATTRIBUTION,
   RESOLUTIONS,
 };

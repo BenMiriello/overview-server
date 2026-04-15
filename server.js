@@ -103,6 +103,45 @@ function haversineDistance(lat1, lng1, lat2, lng2) {
 // Create HTTP server with API routes
 const CLOUDS_ROUTE_RE = /^\/api\/clouds\/([a-z0-9]+)(?:\?(.*))?$/;
 const server = http.createServer((req, res) => {
+  // Cloud history endpoints (before the general cloud route)
+  if (req.url === '/api/clouds/frames' && req.method === 'GET') {
+    cloudMirror.getCloudFrameList()
+      .then(frames => {
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=300',
+        });
+        res.end(JSON.stringify(frames));
+      })
+      .catch(err => {
+        console.error('[cloudMirror] frames error:', err.message);
+        res.writeHead(503, { 'Access-Control-Allow-Origin': '*' });
+        res.end('Cloud frame list unavailable');
+      });
+    return;
+  }
+
+  const cloudHistMatch = req.url.match(/^\/api\/clouds\/history\/(\d+)$/);
+  if (cloudHistMatch && req.method === 'GET') {
+    const ts = parseInt(cloudHistMatch[1], 10);
+    const file = cloudMirror.getCloudFrame(ts);
+    if (!file) {
+      res.writeHead(404, { 'Access-Control-Allow-Origin': '*' });
+      res.end('Cloud history frame not found');
+      return;
+    }
+    const stat = fs.statSync(file);
+    res.writeHead(200, {
+      'Content-Type': 'image/png',
+      'Content-Length': stat.size,
+      'Cache-Control': 'public, max-age=86400',
+      'Access-Control-Allow-Origin': '*',
+    });
+    fs.createReadStream(file).pipe(res);
+    return;
+  }
+
   const cloudsMatch = req.url.match(CLOUDS_ROUTE_RE);
   if (cloudsMatch && req.method === 'GET') {
     const resKey = cloudsMatch[1];
