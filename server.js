@@ -12,6 +12,7 @@ const { captureBlitzortungData } = require('./lightning_data');
 const { verbose } = require('./utils');
 const cloudMirror = require('./cloudMirror');
 const temperatureCache = require('./temperatureCache');
+const precipitationCache = require('./precipitationCache');
 
 // Find the densest cluster of recent strikes by density-peak search.
 // Returns the recency-weighted centroid of strikes within CLUSTER_RADIUS_KM of the peak.
@@ -142,6 +143,70 @@ const server = http.createServer((req, res) => {
         console.error('[temperature] error:', err.message);
         res.writeHead(503, { 'Access-Control-Allow-Origin': '*' });
         res.end('Temperature data unavailable');
+      });
+    return;
+  }
+
+  // Precipitation API — 3 endpoints
+  if (req.url.startsWith('/api/precipitation') && req.method === 'GET') {
+    const framesMatch = req.url === '/api/precipitation/frames';
+    const frameMatch = req.url.match(/^\/api\/precipitation\/(\d{8}_\d{2})$/);
+
+    if (framesMatch) {
+      precipitationCache.getFrameList()
+        .then(frames => {
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=300',
+          });
+          res.end(JSON.stringify(frames));
+        })
+        .catch(err => {
+          console.error('[precipitation] frames error:', err.message);
+          res.writeHead(503, { 'Access-Control-Allow-Origin': '*' });
+          res.end('Precipitation frame list unavailable');
+        });
+      return;
+    }
+
+    if (frameMatch) {
+      const runId = frameMatch[1].replace('_', '/');
+      precipitationCache.getFrame(runId)
+        .then(({ rates, types, fetchedAt, runId: rid }) => {
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=86400',
+            'X-Fetched-At': new Date(fetchedAt).toISOString(),
+            'X-GFS-Run': rid || '',
+          });
+          res.end(JSON.stringify({ rates, types }));
+        })
+        .catch(err => {
+          console.error('[precipitation] frame error:', err.message);
+          res.writeHead(404, { 'Access-Control-Allow-Origin': '*' });
+          res.end('Precipitation frame not found');
+        });
+      return;
+    }
+
+    // Default: latest frame
+    precipitationCache.getLatestFrame()
+      .then(({ rates, types, fetchedAt, runId }) => {
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=21600, stale-while-revalidate=21600',
+          'X-Fetched-At': new Date(fetchedAt).toISOString(),
+          'X-GFS-Run': runId || '',
+        });
+        res.end(JSON.stringify({ rates, types }));
+      })
+      .catch(err => {
+        console.error('[precipitation] error:', err.message);
+        res.writeHead(503, { 'Access-Control-Allow-Origin': '*' });
+        res.end('Precipitation data unavailable');
       });
     return;
   }
